@@ -1,0 +1,325 @@
+#!/usr/bin/perl
+package MyBot;
+use base qw( Bot::BasicBot );
+
+our(@queue);
+our(@modes);
+our(@mode_settings);
+our($returntime);
+our(@helped); #Track helped customers so they don't keep getting re-added to the queue when addressing 'support:'
+our(@ACL);
+
+$ACCESS_LIST = '/home/tsemczyszyn/BOTACCESS';
+@modes = qw(limited);
+@mode_settings = qw(off);
+
+#Bot IRC parameters
+my $bot = MyBot->new (
+
+	server => "irc.freenode.net",
+	channels => ["#sangoma"],
+
+	nick => "Sangoma",
+	name => "Tech support bot",
+
+)->run();
+
+sub init {
+	
+	&parse_acl;
+	return(1);
+}
+
+sub said {
+#Called whenever something is said in any of the channels the bot can see.
+
+	my ($self, $message) = @_;
+		
+
+	#Detect when someone is asking for support and respond with hours or queue them up
+	if ($message->{body} =~ /support|ticket|helpi|sangoma/i ) {
+		@time = localtime(time);
+		if ($time[2] < 9 || $time[2] > 16 || $time[6] == 6 || $time[6] == 0) {
+		
+			return "$message->{who}: Support is available between the hours of 9am and 5pm Eastern time on weekdays via LiveChat at support.sangoma.com. You may submit a support ticket by going to support.sangoma.com or consult our wiki at http://wiki.sangoma.com";
+		}
+
+		else {
+			#return "$message->{who}: If you are looking for Sangoma Technical support please visit us on our Live Chat: http://bit.ly/I1ZXrN"; 
+		 	#return "$message->{who}: If you wish to speak to a Sangoma Technical Support representative please visit wiki.sangoma.com and click on the \"live help\" button on the left side of the screen.  Please also browse through this site for troubleshooting and debugging information.  Alternatively you may visit support.sangoma.com in order to submit a ticket.  Here are instructions: http://wiki.sangoma.com/SangomaTechSupport";
+
+			#Adding user to the queue now only to stop pestering them repeatedly now that we've made the trigger words more broad.
+			return &queue($message->{who},$message->{body});
+		}
+	}
+	
+	#user commands available in the main channel
+	if ($message->{body} =~ /!check/i ) {
+		my $location = &search_queue($message->{who});
+		if ($location) {
+			return "$message->{who}: You are number $location in line for support.";
+		}
+		else {
+			return "$message->{who}: I cannot find you in the support queue. Type \"support: <question>\" and I will add you.";
+		}
+	}
+		
+	#admin commands available in private message. Needs an access list of some kind
+	if ($message->{channel} eq "msg") {
+		if ($message->{body} =~ /^!next/) {
+			if (&authenticate($message->{who}) == 1) { return &next_customer; }
+		}
+		if ($message->{body} =~ /^!list/) {
+			if (&authenticate($message->{who}) == 1) { return &list_queue; }
+		}
+		if ($message->{body} =~ /^!update/) {
+			return &parse_acl;
+		}
+		if ($message->{body} =~ /^!add (.+?)$/) {
+			if (&authenticate($message->{who}) == 1) { return &queue($1); }
+		}
+		if ($message->{body} =~ /^!remove (.+?)$/) {
+			if (&authenticate($message->{who}) == 1) { return &remove($1); }
+		}
+		if ($message->{body} =~ /^!mode (.+?)$/) {
+			if (&authenticate($message->{who}) == 1) { return &mode($1); }
+		}
+		if ($message->{body} =~ /^!clear/) {
+			if (&authenticate($message->{who}) == 1) { return &clear; }
+		}
+		if ($message->{body} =~ /^!die/) {
+			if (&authenticate($message->{who}) == 1) { return &die; }
+		}
+
+	}
+}
+
+sub userquit {
+#detect a user quitting IRC and remove them from the queue and pool.
+	my ($self, $message) = @_;
+	my $location = &search_queue($message->{who});
+	if ($location) {
+		splice(@queue, $location-1, $location);
+	}
+	my $location = undef;
+	my $location = &search_pool($message->{who});
+	if ($location) {
+		splice(@helped, $location-1, $location);
+	}
+
+}
+
+sub chanjoin {
+	my ($self, $message) = @_;
+	unless(&authenticate($message->{who})) {
+
+		$self->say(
+			who=> "$message->{who}",
+			channel=> "msg",
+			body=> "Welcome to the Sangoma community channel. If you would like to reach a technical support representative please visit support.sangoma.com and click on LiveChat. This channel is now being used as a community channel for general discussion. Thank you.",
+		);
+	}
+	return(undef);
+}
+
+sub chanpart {
+#detect a user leaving the channel and remove them from the queue and pool.
+	my ($self, $message) = @_;
+	my $location = &search_queue($message->{who});
+	if ($location) {
+		splice(@queue, $location-1, $location);
+	}
+	my $location = undef;
+	my $location = &search_pool($message->{who});
+	if ($location) {
+		splice(@helped, $location-1, $location);
+	}
+	return undef;
+
+}
+
+sub nick_change {
+#detect nickname changes and update the queue to reflect the changes.
+
+	my $change_nick = &search_queue($_[1]);
+	if ($change_nick) {
+		$queue[$change_nick-1] = $_[2];
+	}
+
+	my $change_nick = &search_pool($_[1]);
+	if ($change_nick) {
+		$helped[$change_nick-1] = $_[2];
+	}
+}
+
+sub queue {
+#adds a user to the queue and reports their position or ignores them if already in the queue.
+
+	my $user = $_[0];
+	my $question = $_[1];
+	my $hour = sprintf("%02s", $time[2]);
+	my $minute = sprintf("%02s", $time[1]);
+	my $second = sprintf("%02s", $time[0]);
+	$question =~ s/support://g;
+	unless ((grep(/^$user/, @queue))||(grep(/^$user/, @helped))) {
+		$position = push(@queue, "$user#.#$question#.#$hour:$minute:$second");
+
+		if ($mode_settings[0] eq "on") { 
+	
+			return "All Sangoma Support staff will be unavailable until $returntime Eastern. In the mean time, you may send us a support request at techdesk\@sangoma.com, or consult http://wiki.sangoma.com/SangomaTechSupport for Debugging/troubleshooting information.";
+
+		}
+
+		else {
+			#return "$user: you have been added to the support queue. You are number $position in line. A support representative will be with you shortly. Type !check to see your position in line.";
+			return "$user: If you are looking for Sangoma Technical support please visit us on our Live Chat: http://bit.ly/I1ZXrN"; 
+		}
+	}
+	else {
+		return undef;
+	}
+}
+
+sub remove { 
+	my $li_item = $_[0];
+	splice(@queue, $li_item-1, $li_item);
+	return("Deleted number $li_item from the list");
+}
+
+
+
+sub search_queue {
+#searches the queue for a username and returns their actual position (not the array index).
+
+	my $user = $_[0];
+	my $loop = 0;
+	my $position = undef;
+	foreach $item (@queue) {
+		$loop++;
+		if ($item =~ /^$user/) {
+			$position = $loop;
+			last;
+		}
+	}	
+	return $position;
+}
+
+sub search_pool {
+#searches the pool for a username and returns their actual position (not the array index).
+
+	my $user = $_[0];
+	my $loop = 0;
+	my $position = undef;
+	foreach $item (@helped) {
+		$loop++;
+		if ($item =~ /^$user/) {
+			$position = $loop;
+			last;
+		}
+	}	
+	return $position;
+}
+
+sub next_customer {
+#takes the customer that is first in line and removes them from the queue/places them in the helped pool. Returns a message indicating their nick.
+			
+	$next = shift(@queue);
+	if (defined $next) {
+
+		(my $user, my $question, my $timestamp) = split(/#\.#/, $next);
+		$junk = push(@helped, $next);
+		return "Next customer: $user - \"$question\" \[$timestamp\]";
+	}
+	else {
+		return "No customers in the queue.";
+	}
+}
+
+sub list_queue {
+#generates a list of names in the queue and returns that list.
+	if (@queue == 0) {
+		return "No customers in the queue.";
+	}
+	else {
+		my $iterate = 1;
+		my $list = "";
+		foreach $line (@queue) {
+			(my $user, my $question, my $timestamp) = split(/#\.#/, $line);
+			$list  = $list . "$iterate: $user - $question \[$timestamp\]\n";
+			$iterate++;
+		}
+		return $list;
+	} 
+}
+
+sub mode {
+#track bot modes and handle the !mode command
+
+	$_[0] =~ /(.+?)\s(.+?)\b(.*?)$/;
+	my (@args);
+	$args[0] = $1;
+	$args[1] = $2;
+	$args[2] = $3;
+
+	$size = scalar(@modes);
+	$out = undef;
+	if ($args[0]=~/list/i) {
+		for ($i=0; $i<$size; $i++) {
+			$out = $out . "$modes[$i]: $mode_settings[$i]\n"; 
+		}
+		return($out);
+	}
+	elsif ($args[0]=~/set/i) {
+		if ($args[1]=~/limited/i) {
+
+			if ($mode_settings[0] eq "off") {
+				unless ($args[2]) { return("Limited support mode requires an estimated return time. Please specify with: !mode set limited <time>")}
+				$mode_settings[0] = "on";
+				$returntime = $args[2];
+				return("Limited support mode ON");
+			}
+			if ($mode_settings[0] eq "on") {
+				$mode_settings[0] = "off";
+				$returntime = undef;
+				return("Limited support mode OFF");
+			}
+		}
+		else {
+			return("Unrecognized mode command");
+		}
+	}
+	else {
+		return("Available mode command options: set list");
+	}
+}
+
+sub parse_acl {
+
+	open(FH, $ACCESS_LIST) || return("Unable to open $ACCESS_LIST");
+	@ACL = <FH>;
+	close(FH);
+	return("Success!");
+}
+
+sub authenticate {
+
+	my $user = $_[0];
+	foreach $item (@ACL) {
+		if ($item =~ /^$user/) {
+			return(1);
+		}
+	}	
+	return(undef);
+}
+
+sub clear {
+#dump the queue and helped pool
+
+	@queue = ();
+	@helped = ();
+	return(undef);
+}
+
+sub die {
+	$bot->shutdown($bot);
+}
